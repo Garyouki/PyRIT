@@ -1175,6 +1175,65 @@ class TestAttackExecution:
         assert persisted_result.outcome is AttackOutcome.UNDETERMINED
         assert AttackPreparationFailure.from_result(result=persisted_result) == preparation_failure
 
+    async def test_mid_run_adversarial_block_is_not_a_preparation_failure(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_objective_scorer: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        sample_response: Message,
+        failure_score: Score,
+    ) -> None:
+        """A block after a turn already reached the target is a truncated run, not a preparation failure.
+
+        The preparation marker tells resume the objective target was never reached, so stamping it
+        here would re-run the objective under fresh conversation ids and orphan the turn that landed.
+        """
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+        scoring_config = AttackScoringConfig(objective_scorer=mock_objective_scorer)
+        attack = RedTeamingAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            attack_scoring_config=scoring_config,
+            prompt_normalizer=mock_prompt_normalizer,
+            max_turns=3,
+        )
+        with (
+            patch.object(
+                attack,
+                "_generate_next_prompt_async",
+                new_callable=AsyncMock,
+                # Turn 1 generates normally; turn 2 is blocked by the adversarial provider.
+                side_effect=[
+                    sample_response,
+                    AdversarialChatResponseBlockedException(
+                        status_code=200,
+                        message="Blocked by content filter.",
+                    ),
+                ],
+            ),
+            patch.object(
+                attack,
+                "_send_prompt_to_objective_target_async",
+                new_callable=AsyncMock,
+                return_value=sample_response,
+            ) as mock_send,
+            patch.object(attack, "_score_response_async", new_callable=AsyncMock, return_value=failure_score),
+        ):
+            result = await attack.execute_async(objective="Test objective")
+
+        assert result.outcome is AttackOutcome.UNDETERMINED
+        # Turn 1 did reach the objective target, so the run carries real data.
+        assert result.executed_turns == 1
+        assert result.last_response is not None
+        mock_send.assert_awaited_once()
+        # The defining assertion: no preparation marker, so resume treats this as completed
+        # rather than re-running the objective under new conversation ids.
+        assert AttackPreparationFailure.from_result(result=result) is None
+        assert "Blocked by content filter." in (result.outcome_reason or "")
+        [persisted_result] = CentralMemory.get_memory_instance().get_attack_results(objective="Test objective")
+        assert AttackPreparationFailure.from_result(result=persisted_result) is None
+
     async def test_unrelated_adversarial_bad_request_still_propagates(
         self,
         mock_objective_target: MagicMock,

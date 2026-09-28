@@ -352,9 +352,25 @@ class RedTeamingAttack(MultiTurnAttackStrategy[MultiTurnAttackContext[Any], Atta
                     context=context, adversarial_manager=adversarial_manager
                 )
             except AdversarialChatResponseBlockedException as blocked:
-                # The adversarial model produced no attacker turn, so the objective target was
-                # never probed. That is an absence of data, not a defensive win for the target,
-                # so the outcome stays UNDETERMINED.
+                # The adversarial model produced no attacker turn, so nothing new was put to the
+                # objective target. That is an absence of data, not a defensive win for the
+                # target, so the outcome stays UNDETERMINED either way.
+                #
+                # The preparation marker specifically means the objective target was never
+                # reached, which resume relies on to re-run the objective. Once a turn has
+                # executed the target has already been probed under this conversation id, so a
+                # mid-run block is a truncated run rather than a preparation failure: marking it
+                # would re-run the objective under fresh conversation ids and orphan the turns
+                # that did land.
+                if context.executed_turns:
+                    return self._create_attack_result(
+                        context=context,
+                        outcome=AttackOutcome.UNDETERMINED,
+                        outcome_reason=(
+                            f"Adversarial chat was blocked after {context.executed_turns} completed turn(s), "
+                            f"truncating the attack before it reached its turn limit. Details: {blocked}"
+                        ),
+                    )
                 kind = AttackPreparationFailureKind.from_exception(blocked)
                 preparation_failure = AttackPreparationFailure(
                     kind=kind,

@@ -792,20 +792,31 @@ class AdversarialBenchmark(Scenario):
         """
         Return parent scenario IDs produced by this benchmark version.
 
+        Mirrors the cached-result lookup: a restored cache artifact can be corrupt or
+        schema-drifted, and reuse is only an optimization, so a read failure degrades to
+        "no compatible parent" and the run proceeds cold instead of aborting initialization.
+
         Args:
             results: Cached candidates whose parent scenarios should be checked.
 
         Returns:
-            set[str]: IDs of compatible parent scenario results.
+            set[str]: IDs of compatible parent scenario results. Empty when the lookup fails.
         """
         parent_ids = sorted({result.attribution_parent_id for result in results if result.attribution_parent_id})
         if not parent_ids:
             return set()
-        parent_results = self._memory.get_scenario_results(
-            scenario_result_ids=parent_ids,
-            scenario_name=type(self).__name__,
-            scenario_version=self.VERSION,
-        )
+        try:
+            parent_results = self._memory.get_scenario_results(
+                scenario_result_ids=parent_ids,
+                scenario_name=type(self).__name__,
+                scenario_version=self.VERSION,
+            )
+        except Exception as e:
+            logger.warning(
+                f"AdversarialBenchmark: cached parent-scenario lookup failed ({e!s}); "
+                "running without cache reuse for this run."
+            )
+            return set()
         return {
             str(result.id)
             for result in parent_results
@@ -965,11 +976,19 @@ class AdversarialBenchmark(Scenario):
         # Per-attack attribution filter: only count results that were produced for this
         # specific atomic_attack_name slot (dataset-level scoping via parent_collection).
         for attack in atomic_attacks:
-            raw_results = [
-                result
-                for lookup_hash in lookup_hashes_by_name[attack.atomic_attack_name]
-                for result in raw_results_by_hash[lookup_hash]
-            ]
+            # Each bucket is newest-first on its own, but concatenating buckets does not preserve
+            # that order and the reuse pass below keeps the first row it sees per objective.
+            # Re-sort so "newest wins" still holds when an objective appears under more than one
+            # lookup hash.
+            raw_results = sorted(
+                (
+                    result
+                    for lookup_hash in lookup_hashes_by_name[attack.atomic_attack_name]
+                    for result in raw_results_by_hash[lookup_hash]
+                ),
+                key=lambda result: result.timestamp,
+                reverse=True,
+            )
             attributed = [
                 r
                 for r in raw_results

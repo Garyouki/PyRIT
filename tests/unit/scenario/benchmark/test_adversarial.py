@@ -971,15 +971,22 @@ class TestGetAtomicAttacksCrossProduct:
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_RESULT_TIMESTAMP = datetime(2024, 1, 1, tzinfo=UTC)
+
+
 def _make_attack_result_with_outcome(outcome: AttackOutcome) -> MagicMock:
     """Build a minimal ``AttackResult`` stand-in for cache-hit tests.
 
     The new analytics-backed cache filter only reads ``outcome`` off each
     match — the (technique × objective target) keying is done by the
     analytics lookup parameters, not by introspecting result fields.
+
+    A concrete ``timestamp`` is set because persisted results always carry one and the
+    cache merge orders on it; tests that care about ordering override it explicitly.
     """
     ar = MagicMock()
     ar.outcome = outcome
+    ar.timestamp = _DEFAULT_RESULT_TIMESTAMP
     return ar
 
 
@@ -989,6 +996,7 @@ def _make_attack_result_with_attribution(*, outcome: AttackOutcome, parent_colle
     ar.outcome = outcome
     ar.objective = "skip_cached_objective"
     ar.attribution_data = {"parent_collection": parent_collection}
+    ar.timestamp = _DEFAULT_RESULT_TIMESTAMP
     return ar
 
 
@@ -1254,6 +1262,39 @@ class TestCollectCachedCompletionPairs:
         assert cached == set()
         assert bench._cached_results_by_name == {}
         assert "cached-result lookup failed" in caplog.text
+
+    def test_merged_lookup_buckets_are_sorted_newest_first(self):
+        """An objective present under two lookup hashes must still resolve newest-first.
+
+        Each bucket is newest-first on its own, but the buckets are merged from a set, so the
+        concatenation order is arbitrary. Reuse keeps the first row it sees per objective, so an
+        unsorted merge can retain an older result than the cache actually holds.
+        """
+        bench = self._make_bench()
+        candidate = self._make_candidate(
+            technique_eval_hash="hash_technique",
+            inner_attack_eval_hash="hash_inner",
+            atomic_attack_name="attack_a",
+        )
+        older = _make_attack_result_with_attribution(
+            outcome=AttackOutcome.SUCCESS,
+            parent_collection="attack_a",
+        )
+        older.timestamp = datetime(2024, 1, 1, tzinfo=UTC)
+        newer = _make_attack_result_with_attribution(
+            outcome=AttackOutcome.SUCCESS,
+            parent_collection="attack_a",
+        )
+        newer.timestamp = datetime(2025, 1, 1, tzinfo=UTC)
+
+        def _lookup(*args, **kwargs):
+            return [older] if kwargs["technique_eval_hash"] == "hash_technique" else [newer]
+
+        with self._patch_identifier(), patch(self._ANALYTICS_PATH, side_effect=_lookup):
+            cached = bench._collect_cached_completion_pairs(atomic_attacks=[candidate])
+
+        assert cached == {"attack_a"}
+        assert bench._cached_results_by_name["attack_a"] == [newer, older]
 
     def test_identifier_construction_failure_is_not_silently_treated_as_cache_miss(self):
         bench = self._make_bench()
@@ -2090,6 +2131,30 @@ class TestReusableCachedResults:
         reusable = bench._collect_reusable_cached_results(atomic_attacks=[candidate])
 
         assert reusable == {"attack_a": [newest]}
+
+    def test_parent_scenario_lookup_failure_degrades_to_cold_run(self, caplog):
+        """The parent-scenario read must degrade like the analytics read, not abort initialization.
+
+        ``_collect_reusable_cached_results`` runs inside ``_build_atomic_attacks_async`` with no
+        guard of its own, so an exception escaping here would fail the whole run instead of
+        simply giving up on reuse.
+        """
+        scorer = _make_scorer_identifier(question="achieved")
+        parent_id = str(uuid.uuid4())
+        candidate = _make_cache_candidate(scorer_identifier=scorer, objectives=["objective"])
+        cached = _make_exact_cached_result(
+            objective="objective",
+            scorer_identifier=scorer,
+            parent_id=parent_id,
+        )
+        bench = self._make_bench_with_candidates(candidate=candidate, cached_results=[cached])
+        bench._memory.get_scenario_results.side_effect = RuntimeError("scenario read blew up")
+
+        with caplog.at_level(logging.WARNING):
+            reusable = bench._collect_reusable_cached_results(atomic_attacks=[candidate])
+
+        assert reusable == {}
+        assert "parent-scenario lookup failed" in caplog.text
 
     def test_apply_cache_drops_only_reused_objective(self):
         scorer = _make_scorer_identifier(question="achieved")
