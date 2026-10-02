@@ -69,14 +69,15 @@ class AudioVolumeConverter(Converter):
             numpy array with the volume adjusted, same length and dtype as input.
         """
         midpoint = 128 if data.dtype == np.uint8 else 0
-        scaled = (data.astype(np.float64) - midpoint) * self._volume_factor + midpoint
+        scaled = (data.astype(np.float64) - midpoint) * self._volume_factor
 
-        # Clip to the valid range for the original dtype
+        # Clip and quantize amplitudes before restoring an unsigned midpoint.
         if np.issubdtype(data.dtype, np.integer):
             info = np.iinfo(data.dtype)
-            scaled = np.clip(scaled, info.min, info.max)
+            scaled = np.clip(scaled, info.min - midpoint, info.max - midpoint)
+            scaled = np.trunc(scaled)
 
-        return scaled
+        return scaled + midpoint
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "audio_path") -> ConverterResult:
         """

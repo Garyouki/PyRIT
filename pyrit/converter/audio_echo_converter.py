@@ -82,14 +82,13 @@ class AudioEchoConverter(Converter):
         if delay_samples < len(data):
             output[delay_samples:] += self._decay * centered_data[: len(data) - delay_samples]
 
-        output += midpoint
-
-        # Clip to the valid range for the original dtype
+        # Clip and quantize amplitudes before restoring an unsigned midpoint.
         if np.issubdtype(data.dtype, np.integer):
             info = np.iinfo(data.dtype)
-            output = np.clip(output, info.min, info.max)
+            output = np.clip(output, info.min - midpoint, info.max - midpoint)
+            output = np.trunc(output)
 
-        return output
+        return output + midpoint
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "audio_path") -> ConverterResult:
         """
